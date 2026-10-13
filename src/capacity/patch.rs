@@ -11,11 +11,12 @@ use windows::Win32::System::{
     Threading::GetCurrentProcess,
 };
 
-pub const OLD_BUDGET: u32 = 128 * 1024;
+pub const OLD_BUDGET: u32 = shikifsrs_elden_ring::animation_capacity::ORIGINAL_WORKER_BUDGET;
 #[path = "clip_index.rs"]
 mod clip_index;
-pub const NEW_BUDGET: u32 = 1024 * 1024;
-pub const PATCH_RVA: usize = 0xE83E1F;
+pub const NEW_BUDGET: u32 = shikifsrs_elden_ring::animation_capacity::EXPANDED_WORKER_BUDGET;
+pub const PATCH_RVA: usize =
+    shikifsrs_elden_ring::animation_capacity::animation_capacity_edits()[0].rva as usize;
 const WINDOW_RVA: usize = 0xE83E13;
 const TEXT_RVA: usize = 0x1000;
 const TEXT_LENGTH: usize = 0x29A4800;
@@ -25,7 +26,8 @@ const EDITS: [clip_index::Edit; 5] = [
     clip_index::Edit {
         rva: PATCH_RVA,
         original: &[2],
-        replacement: &[0x10],
+        replacement: shikifsrs_elden_ring::animation_capacity::animation_capacity_edits()[0]
+            .replacement,
     },
     clip_index::EDITS[0],
     clip_index::EDITS[1],
