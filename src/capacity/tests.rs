@@ -96,13 +96,17 @@ fn clip_guards_mixed_patches_and_late_world_refuse_before_writes() {
 
 #[test]
 fn transaction_api_failures_restore_all_windows_and_page_protections() {
+    transaction_profile(&LEGACY);
+    transaction_profile(&profile272::PROFILE);
+}
+fn transaction_profile(profile: &Profile) {
     let pointer =
         unsafe { VirtualAlloc(None, IMAGE_LENGTH, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
             .cast::<u8>();
     assert!(!pointer.is_null());
     let page = CodePage(pointer);
     let base = pointer as usize;
-    for edit in EDITS {
+    for edit in profile.edits {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 edit.original.as_ptr(),
@@ -114,10 +118,18 @@ fn transaction_api_failures_restore_all_windows_and_page_protections() {
     let mut old = PAGE_PROTECTION_FLAGS::default();
     unsafe { VirtualProtect(pointer.cast(), IMAGE_LENGTH, PAGE_EXECUTE_READ, &mut old) }.unwrap();
     // Four unique pages, flush, then four restores. Name edits share one page.
-    for failure in 0..9 {
+    let page_count = profile
+        .edits
+        .iter()
+        .flat_map(|edit| {
+            ((edit.rva & !4095)..=((edit.rva + edit.original.len() - 1) & !4095)).step_by(4096)
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    for failure in 0..(2 * page_count + 1) {
         let mut call = 0;
         let result = unsafe {
-            write_edits(base, || {
+            write_edits_for_profile(base, profile, || {
                 let allow = call != failure;
                 call += 1;
                 allow
@@ -127,7 +139,7 @@ fn transaction_api_failures_restore_all_windows_and_page_protections() {
             result.is_err(),
             "injected operation {failure} was not exercised"
         );
-        for edit in EDITS {
+        for edit in profile.edits {
             let actual =
                 unsafe { std::slice::from_raw_parts(pointer.add(edit.rva), edit.original.len()) };
             assert_eq!(actual, edit.original, "rollback operation {failure}");
@@ -142,14 +154,17 @@ fn transaction_api_failures_restore_all_windows_and_page_protections() {
             assert_eq!(info.Protect, PAGE_EXECUTE_READ);
         }
     }
-    assert_eq!(unsafe { write_edits(base, || true) }, Ok(()));
-    for edit in EDITS {
+    assert_eq!(
+        unsafe { write_edits_for_profile(base, profile, || true) },
+        Ok(())
+    );
+    for edit in profile.edits {
         let actual =
             unsafe { std::slice::from_raw_parts(pointer.add(edit.rva), edit.replacement.len()) };
         assert_eq!(actual, edit.replacement);
     }
-    assert!(unsafe { write_edits(base, || true) }.is_err());
-    for edit in EDITS {
+    assert!(unsafe { write_edits_for_profile(base, profile, || true) }.is_err());
+    for edit in profile.edits {
         let actual =
             unsafe { std::slice::from_raw_parts(pointer.add(edit.rva), edit.replacement.len()) };
         assert_eq!(
@@ -233,10 +248,12 @@ fn audited_executable_hash_headers_and_all_instruction_guards() {
         return;
     };
     let bytes = std::fs::read(path).unwrap();
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&bytes)),
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    assert!(matches!(
+        hash.as_str(),
         "1a3547101327f65d0c76da2f9190ac0aa66871ea42bae2aecc61e11a8b597891"
-    );
+            | "f9118fea2cfd8fa3901e8060bfadb1552cb2471771ded8a5b662c4e298ffb328"
+    ));
     let pe = PeFile::from_bytes(&bytes).unwrap();
     let mut mapped = vec![0; IMAGE_LENGTH];
     mapped[..4096].copy_from_slice(&bytes[..4096]);
@@ -246,7 +263,20 @@ fn audited_executable_hash_headers_and_all_instruction_guards() {
         mapped[start..start + raw.len()].copy_from_slice(raw);
     }
     assert_eq!(check(&mapped), Ok(()));
-    assert_eq!(u32_at(&mapped, 0x3B445F8), Some(512 * 1024));
+    if hash.starts_with("1a354710") {
+        assert_eq!(u32_at(&mapped, 0x3B445F8), Some(512 * 1024));
+    }
+    let nt = u32_at(&mapped, 0x3c).unwrap() as usize;
+    let profile = select_profile(u32_at(&mapped, nt + 8).unwrap()).unwrap();
+    for &(rva, _) in profile.guards {
+        mapped[rva] ^= 1;
+        assert!(
+            check(&mapped).is_err(),
+            "accepted modified guard at {rva:x}"
+        );
+        mapped[rva] ^= 1;
+    }
+    assert_eq!(check(&mapped), Ok(()));
 }
 
 #[test]
@@ -268,10 +298,11 @@ fn full_patch_on_private_image_mapping_preserves_disk_executable() {
         return;
     };
     let before = Sha256::digest(std::fs::read(&path).unwrap());
-    assert_eq!(
-        format!("{before:x}"),
+    assert!(matches!(
+        format!("{before:x}").as_str(),
         "1a3547101327f65d0c76da2f9190ac0aa66871ea42bae2aecc61e11a8b597891"
-    );
+            | "f9118fea2cfd8fa3901e8060bfadb1552cb2471771ded8a5b662c4e298ffb328"
+    ));
     // SEC_IMAGE gives private copy-on-write image pages. No entry point or
     // game thread is executed; the backing file is opened read-only.
     let file = File::open(&path).unwrap();
@@ -300,17 +331,20 @@ fn full_patch_on_private_image_mapping_preserves_disk_executable() {
     });
     assert!(!mapping.1.Value.is_null());
     let base = mapping.1.Value as usize;
-    let original_text = unsafe { image_bytes(base, TEXT_RVA, TEXT_LENGTH) }
+    let header = unsafe { image_bytes(base, 0, 4096) }.unwrap();
+    let nt = u32_at(header, 0x3c).unwrap() as usize;
+    let profile = select_profile(u32_at(header, nt + 8).unwrap()).unwrap();
+    let original_text = unsafe { image_bytes(base, TEXT_RVA, profile.text_length) }
         .unwrap()
         .to_vec();
     assert_eq!(unsafe { apply(base) }, Ok(()));
-    for edit in EDITS {
+    for edit in profile.edits {
         assert_eq!(
             unsafe { image_bytes(base, edit.rva, edit.replacement.len()) }.unwrap(),
             edit.replacement
         );
     }
-    let modified_text = unsafe { image_bytes(base, TEXT_RVA, TEXT_LENGTH) }.unwrap();
+    let modified_text = unsafe { image_bytes(base, TEXT_RVA, profile.text_length) }.unwrap();
     let actual_changes: Vec<_> = original_text
         .iter()
         .zip(modified_text)
@@ -318,7 +352,8 @@ fn full_patch_on_private_image_mapping_preserves_disk_executable() {
         .filter(|(_, (before, after))| before != after)
         .map(|(offset, _)| offset + TEXT_RVA)
         .collect();
-    let mut expected_changes: Vec<_> = EDITS
+    let mut expected_changes: Vec<_> = profile
+        .edits
         .iter()
         .flat_map(|edit| {
             edit.original
@@ -334,16 +369,16 @@ fn full_patch_on_private_image_mapping_preserves_disk_executable() {
         actual_changes, expected_changes,
         "no unrelated executable bytes may change"
     );
-    let after = unsafe { image_bytes(base, WINDOW_RVA, WINDOW.len()) }.unwrap();
+    let after = unsafe { image_bytes(base, profile.window_rva, profile.window.len()) }.unwrap();
     let differences: Vec<_> = after
         .iter()
-        .zip(WINDOW)
+        .zip(profile.window)
         .enumerate()
         .filter(|(_, (a, b))| a != b)
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(differences, [PATCH_RVA - WINDOW_RVA]);
-    assert_eq!(after[PATCH_RVA - WINDOW_RVA], 0x10);
+    assert_eq!(differences, [profile.edits[0].rva - profile.window_rva]);
+    assert_eq!(after[profile.edits[0].rva - profile.window_rva], 0x10);
     assert!(unsafe { apply(base) }.is_err());
     drop(mapping);
     assert_eq!(Sha256::digest(std::fs::read(&path).unwrap()), before);

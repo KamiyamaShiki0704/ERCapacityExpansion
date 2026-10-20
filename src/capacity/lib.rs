@@ -48,8 +48,8 @@ fn process_attach(module: HINSTANCE) -> i32 {
         return 0;
     }
 
-    // Do not defer installation to the logger: workers may be created as
-    // soon as the loader returns. This path does no file I/O or allocation.
+    // Keep installation synchronous: workers can start as the loader returns.
+    // WW272 identity uses the SDK's heap-backed file hash before any write.
     let result = apply_to_host();
     let module = module.0 as usize;
     let _ = std::thread::Builder::new()
@@ -81,5 +81,7 @@ fn apply_to_host() -> Result<(), &'static str> {
     if host != named {
         return Err("host is not eldenring.exe; no memory writes");
     }
+    eldenring::initialize_game_bindings()
+        .map_err(|_| "unsupported executable identity; no writes")?;
     unsafe { patch::apply(host.0 as usize) }
 }

@@ -120,6 +120,36 @@ const GUARDS: &[(usize, &[u8])] = &[
     ),
 ];
 
+struct Profile {
+    timestamp: u32,
+    image_length: usize,
+    text_length: usize,
+    world_rva: usize,
+    window_rva: usize,
+    window: &'static [u8],
+    guards: &'static [(usize, &'static [u8])],
+    edits: &'static [clip_index::Edit],
+}
+const LEGACY: Profile = Profile {
+    timestamp: 0x6a96b418,
+    image_length: IMAGE_LENGTH,
+    text_length: TEXT_LENGTH,
+    world_rva: WORLD_RVA,
+    window_rva: WINDOW_RVA,
+    window: WINDOW,
+    guards: GUARDS,
+    edits: &EDITS,
+};
+#[path = "profile272.rs"]
+mod profile272;
+fn select_profile(timestamp: u32) -> Result<&'static Profile, &'static str> {
+    match timestamp {
+        0x6a96b418 => Ok(&LEGACY),
+        0x6aabf7e7 => Ok(&profile272::PROFILE),
+        _ => Err("unsupported PE build; expected audited ER 2.7.1.0 or 2.7.2.0"),
+    }
+}
+
 fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -141,46 +171,49 @@ fn validate<'a>(read: impl Fn(usize, usize) -> Option<&'a [u8]>) -> Result<(), &
     if nt > 1024 || header.get(nt..nt + 4) != Some(b"PE\0\0") {
         return Err("invalid PE signature");
     }
+    let profile = select_profile(u32_at(header, nt + 8).ok_or("invalid timestamp")?)?;
     if u16_at(header, nt + 4) != Some(0x8664)
         || u16_at(header, nt + 6) != Some(11)
-        || u32_at(header, nt + 8) != Some(0x6A96B418)
+        || u32_at(header, nt + 8) != Some(profile.timestamp)
         || u16_at(header, nt + 20) != Some(240)
         || u16_at(header, nt + 24) != Some(0x20b)
-        || u32_at(header, nt + 24 + 56) != Some(IMAGE_LENGTH as u32)
+        || u32_at(header, nt + 24 + 56) != Some(profile.image_length as u32)
     {
         return Err("unsupported PE build; expected audited ER 2.7.1.0");
     }
     let section = nt + 24 + 240;
     if header.get(section..section + 8) != Some(b".text\0\0\0")
-        || u32_at(header, section + 8) != Some(TEXT_LENGTH as u32)
+        || u32_at(header, section + 8) != Some(profile.text_length as u32)
         || u32_at(header, section + 12) != Some(TEXT_RVA as u32)
     {
         return Err("unexpected executable section layout");
     }
-    for &(rva, expected) in GUARDS {
+    for &(rva, expected) in profile.guards {
         if read(rva, expected.len()) != Some(expected) {
             return Err("instruction guard mismatch or conflicting patch; no writes");
         }
     }
-    for edit in EDITS {
+    for edit in profile.edits {
         if edit.original.len() != edit.replacement.len()
-            || edit.rva / 4096 != (edit.rva + edit.original.len() - 1) / 4096
+            || edit.original.is_empty()
+            || edit.original.len() > 4096
+            || edit.rva + edit.original.len() > profile.image_length
             || read(edit.rva, edit.original.len()) != Some(edit.original)
         {
             return Err("clip-index instruction guard mismatch or conflicting patch; no writes");
         }
     }
-    if read(WORLD_RVA, 8) != Some(&[0u8; 8]) {
+    if read(profile.world_rva, 8) != Some(&[0u8; 8]) {
         return Err(
             "game world already initialized or unreadable; startup loading required; no writes",
         );
     }
-    let text = read(TEXT_RVA, TEXT_LENGTH).ok_or("unreadable executable section")?;
+    let text = read(TEXT_RVA, profile.text_length).ok_or("unreadable executable section")?;
     let mut matches = text
-        .windows(WINDOW.len())
+        .windows(profile.window.len())
         .enumerate()
-        .filter(|(_, b)| *b == WINDOW);
-    if matches.next().map(|(offset, _)| offset + TEXT_RVA) != Some(WINDOW_RVA)
+        .filter(|(_, b)| *b == profile.window);
+    if matches.next().map(|(offset, _)| offset + TEXT_RVA) != Some(profile.window_rva)
         || matches.next().is_some()
     {
         return Err("constructor signature missing or ambiguous");
@@ -225,23 +258,30 @@ unsafe fn image_bytes<'a>(base: usize, rva: usize, length: usize) -> Option<&'a 
 
 pub unsafe fn apply(base: usize) -> Result<(), &'static str> {
     validate(|rva, length| unsafe { image_bytes(base, rva, length) })?;
-    unsafe { write_edits(base, || true) }
+    let header = unsafe { image_bytes(base, 0, 4096) }.ok_or("unreadable PE header")?;
+    let nt = u32_at(header, 0x3c).ok_or("invalid PE offset")? as usize;
+    let profile = select_profile(u32_at(header, nt + 8).ok_or("invalid PE timestamp")?)?;
+    unsafe { write_edits_for_profile(base, profile, || true) }
 }
 
 // Startup-only: callers must ensure no thread can execute these windows yet.
 // The callback permits deterministic API failure tests without game injection.
-unsafe fn write_edits(
+unsafe fn write_edits_for_profile(
     base: usize,
+    profile: &Profile,
     mut before_api: impl FnMut() -> bool,
 ) -> Result<(), &'static str> {
-    let mut pages = [0usize; 5];
-    let mut protections = [PAGE_PROTECTION_FLAGS::default(); 5];
+    let mut pages = [0usize; 10];
+    let mut protections = [PAGE_PROTECTION_FLAGS::default(); 10];
     let mut count = 0;
-    for edit in EDITS {
-        let page = (base + edit.rva) & !4095;
-        if !pages[..count].contains(&page) {
-            pages[count] = page;
-            count += 1;
+    for edit in profile.edits {
+        let first = (base + edit.rva) & !4095;
+        let last = (base + edit.rva + edit.original.len() - 1) & !4095;
+        for page in (first..=last).step_by(4096) {
+            if !pages[..count].contains(&page) {
+                pages[count] = page;
+                count += 1;
+            }
         }
     }
     let protect = |page: usize, flags, old: &mut PAGE_PROTECTION_FLAGS| unsafe {
@@ -251,7 +291,7 @@ unsafe fn write_edits(
         FlushInstructionCache(
             GetCurrentProcess(),
             Some(base as *const c_void),
-            IMAGE_LENGTH,
+            profile.image_length,
         )
         .is_ok()
     };
@@ -269,12 +309,12 @@ unsafe fn write_edits(
             );
         }
     }
-    let originals_match = EDITS.iter().all(|edit| unsafe {
+    let originals_match = profile.edits.iter().all(|edit| unsafe {
         std::slice::from_raw_parts((base + edit.rva) as *const u8, edit.original.len())
             == edit.original
     });
     if originals_match {
-        for edit in EDITS {
+        for edit in profile.edits {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     edit.replacement.as_ptr(),
@@ -301,7 +341,7 @@ unsafe fn write_edits(
     }
     // Some pages may already be RX. Reopen before rollback, never store to a
     // page whose protection could not be acquired, and do not undo foreign bytes.
-    let mut writable = [false; 5];
+    let mut writable = [false; 10];
     for i in 0..count {
         writable[i] = protect(
             pages[i],
@@ -310,13 +350,19 @@ unsafe fn write_edits(
         );
     }
     if originals_match {
-        for edit in EDITS {
-            let page = (base + edit.rva) & !4095;
-            let index = pages[..count].iter().position(|p| *p == page).unwrap();
+        for edit in profile.edits {
+            let first = (base + edit.rva) & !4095;
+            let last = (base + edit.rva + edit.original.len() - 1) & !4095;
+            let all_writable = (first..=last).step_by(4096).all(|page| {
+                pages[..count]
+                    .iter()
+                    .position(|p| *p == page)
+                    .is_some_and(|i| writable[i])
+            });
             let current = unsafe {
                 std::slice::from_raw_parts((base + edit.rva) as *const u8, edit.replacement.len())
             };
-            if writable[index] && current == edit.replacement {
+            if all_writable && current == edit.replacement {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         edit.original.as_ptr(),
